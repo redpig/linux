@@ -13,9 +13,11 @@
 #ifndef _ASM_X86_SYSCALL_H
 #define _ASM_X86_SYSCALL_H
 
+#include <linux/audit.h>
 #include <linux/sched.h>
 #include <linux/err.h>
 #include <asm/asm-offsets.h>	/* For NR_syscalls */
+#include <asm/thread_info.h>	/* for is_ia32_task */
 #include <asm/unistd.h>
 
 extern const unsigned long sys_call_table[];
@@ -86,6 +88,12 @@ static inline void syscall_set_arguments(struct task_struct *task,
 {
 	BUG_ON(i + n > 6);
 	memcpy(&regs->bx + i, args, n * sizeof(args[0]));
+}
+
+static inline int syscall_get_arch(struct task_struct *task,
+				   struct pt_regs *regs)
+{
+	return AUDIT_ARCH_I386;
 }
 
 #else	 /* CONFIG_X86_64 */
@@ -212,6 +220,14 @@ static inline void syscall_set_arguments(struct task_struct *task,
 		}
 }
 
+static inline int syscall_get_arch(struct task_struct *task,
+				   struct pt_regs *regs)
+{
+	if (is_ia32_task())
+		return AUDIT_ARCH_I386;
+	/* Both x32 and x86_64 are considered "64-bit". */
+	return AUDIT_ARCH_X86_64;
+}
 #endif	/* CONFIG_X86_32 */
 
 #endif	/* _ASM_X86_SYSCALL_H */
