@@ -110,6 +110,9 @@ struct sock_fprog {	/* Required for SO_ATTACH_FILTER. */
  */
 #define BPF_MEMWORDS 16
 
+/* BPF program (checking) flags */
+#define BPF_CHK_FLAGS_NO_SKB	1
+
 /* RATIONALE. Negative offsets are invalid in BPF.
    We use them to reference ancillary data.
    Unlike introduction new instructions, it does not break
@@ -145,6 +148,33 @@ struct sk_filter
 	struct sock_filter     	insns[0];
 };
 
+/**
+ * struct bpf_load_fn - callback and data for bpf_run_filter
+ * This structure is used by bpf_run_filter if bpf_chk_filter
+ * was invoked with BPF_CHK_FLAGS_NO_SKB.
+ *
+ * @load:
+ *   @data: const pointer to the data passed into bpf_run_filter
+ *   @k: offset into @skb's data
+ *   @size: the size of the requested data in bytes: 1, 2, or 4.
+ *   @buffer: If non-NULL, a 32-bit buffer for staging data.
+ *
+ * Returns a pointer to the requested data.
+ *
+ * This function operates similarly to load_pointer in net/core/filter.c
+ * except that the pointer to the returned data must already be
+ * byteswapped as appropriate to the source data and endianness.
+ * @buffer may be used if the data needs to be staged.
+ *
+ * @length: the length of the supplied data for use by the LD*_LEN
+ *          instructions.
+ */
+struct bpf_load_fn {
+	void *(*load)(const void *data, int k, unsigned int size,
+			 void *buffer);
+	u32 length;
+};
+
 static inline unsigned int sk_filter_len(const struct sk_filter *fp)
 {
 	return fp->len * sizeof(struct sock_filter) + sizeof(*fp);
@@ -153,9 +183,15 @@ static inline unsigned int sk_filter_len(const struct sk_filter *fp)
 extern int sk_filter(struct sock *sk, struct sk_buff *skb);
 extern unsigned int sk_run_filter(const struct sk_buff *skb,
 				  const struct sock_filter *filter);
+extern unsigned int bpf_run_filter(const void *data,
+				   const struct sock_filter *filter,
+				   const struct bpf_load_fn *load_fn);
 extern int sk_attach_filter(struct sock_fprog *fprog, struct sock *sk);
 extern int sk_detach_filter(struct sock *sk);
+
 extern int sk_chk_filter(struct sock_filter *filter, unsigned int flen);
+extern int bpf_chk_filter(struct sock_filter *filter, unsigned int flen, u32 flags);
+
 
 #ifdef CONFIG_BPF_JIT
 extern void bpf_jit_compile(struct sk_filter *fp);
@@ -228,6 +264,16 @@ enum {
 	BPF_S_ANC_HATYPE,
 	BPF_S_ANC_RXHASH,
 	BPF_S_ANC_CPU,
+	/* Used to differentiate SKB data and generic data */
+	BPF_S_ANC_LD_W_ABS,
+	BPF_S_ANC_LD_H_ABS,
+	BPF_S_ANC_LD_B_ABS,
+	BPF_S_ANC_LD_W_LEN,
+	BPF_S_ANC_LD_W_IND,
+	BPF_S_ANC_LD_H_IND,
+	BPF_S_ANC_LD_B_IND,
+	BPF_S_ANC_LDX_W_LEN,
+	BPF_S_ANC_LDX_B_MSH,
 };
 
 #endif /* __KERNEL__ */

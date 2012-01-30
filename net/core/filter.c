@@ -98,9 +98,10 @@ int sk_filter(struct sock *sk, struct sk_buff *skb)
 EXPORT_SYMBOL(sk_filter);
 
 /**
- *	sk_run_filter - run a filter on a socket
- *	@skb: buffer to run the filter on
+ *	bpf_run_filter - run a BPF filter program on @data
+ *	@data: buffer to run the filter on
  *	@fentry: filter to apply
+ *	@load_fn: custom data accessor
  *
  * Decode and apply filter instructions to the skb->data.
  * Return length to keep, 0 for none. @skb is the data we are
@@ -109,8 +110,9 @@ EXPORT_SYMBOL(sk_filter);
  * and last instruction guaranteed to be a RET, we dont need to check
  * flen. (We used to pass to this function the length of filter)
  */
-unsigned int sk_run_filter(const struct sk_buff *skb,
-			   const struct sock_filter *fentry)
+unsigned int bpf_run_filter(const void *data,
+			    const struct sock_filter *fentry,
+			    const struct bpf_load_fn *load_fn)
 {
 	void *ptr;
 	u32 A = 0;			/* Accumulator */
@@ -118,6 +120,7 @@ unsigned int sk_run_filter(const struct sk_buff *skb,
 	u32 mem[BPF_MEMWORDS];		/* Scratch Memory Store */
 	u32 tmp;
 	int k;
+	const struct sk_buff *skb = data;
 
 	/*
 	 * Process array of filter instructions.
@@ -350,6 +353,55 @@ load_b:
 				A = 0;
 			continue;
 		}
+		case BPF_S_ANC_LD_W_ABS:
+			k = K;
+load_fn_w:
+			ptr = load_fn->load(data, k, 4, &tmp);
+			if (ptr) {
+				A = *(u32 *)ptr;
+				continue;
+			}
+			return 0;
+		case BPF_S_ANC_LD_H_ABS:
+			k = K;
+load_fn_h:
+			ptr = load_fn->load(data, k, 2, &tmp);
+			if (ptr) {
+				A = *(u16 *)ptr;
+				continue;
+			}
+			return 0;
+		case BPF_S_ANC_LD_B_ABS:
+			k = K;
+load_fn_b:
+			ptr = load_fn->load(data, k, 1, &tmp);
+			if (ptr) {
+				A = *(u8 *)ptr;
+				continue;
+			}
+			return 0;
+		case BPF_S_ANC_LDX_B_MSH:
+			ptr = load_fn->load(data, K, 1, &tmp);
+			if (ptr) {
+				X = (*(u8 *)ptr & 0xf) << 2;
+				continue;
+			}
+			return 0;
+		case BPF_S_ANC_LD_W_IND:
+			k = X + K;
+			goto load_fn_w;
+		case BPF_S_ANC_LD_H_IND:
+			k = X + K;
+			goto load_fn_h;
+		case BPF_S_ANC_LD_B_IND:
+			k = X + K;
+			goto load_fn_b;
+		case BPF_S_ANC_LD_W_LEN:
+			A = load_fn->length;
+			continue;
+		case BPF_S_ANC_LDX_W_LEN:
+			X = load_fn->length;
+			continue;
 		default:
 			WARN_RATELIMIT(1, "Unknown code:%u jt:%u tf:%u k:%u\n",
 				       fentry->code, fentry->jt,
@@ -359,6 +411,21 @@ load_b:
 	}
 
 	return 0;
+}
+EXPORT_SYMBOL(bpf_run_filter);
+
+/**
+ *	sk_run_filter - run a filter on a socket
+ *	@skb: buffer to run the filter on
+ *	@fentry: filter to apply
+ *
+ * Runs bpf_run_filter with the struct sk_buff-specific data
+ * accessor behavior.
+ */
+unsigned int sk_run_filter(const struct sk_buff *skb,
+					 const struct sock_filter *filter)
+{
+	return bpf_run_filter(skb, filter, NULL);
 }
 EXPORT_SYMBOL(sk_run_filter);
 
@@ -423,9 +490,10 @@ error:
 }
 
 /**
- *	sk_chk_filter - verify socket filter code
+ *	bpf_chk_filter - verify socket filter BPF code
  *	@filter: filter to verify
  *	@flen: length of filter
+ *	@flags: May be BPF_CHK_FLAGS_NO_SKB or 0
  *
  * Check the user's filter code. If we let some ugly
  * filter code slip through kaboom! The filter must contain
@@ -434,9 +502,13 @@ error:
  *
  * All jumps are forward as they are not signed.
  *
+ * If BPF_CHK_FLAGS_NO_SKB is set in flags, any SKB-specific
+ * rules become illegal and a bpf_load_fn will be expected by
+ * bpf_run_filter.
+ *
  * Returns 0 if the rule set is legal or -EINVAL if not.
  */
-int sk_chk_filter(struct sock_filter *filter, unsigned int flen)
+int bpf_chk_filter(struct sock_filter *filter, unsigned int flen, u32 flags)
 {
 	/*
 	 * Valid instructions are initialized to non-0.
@@ -542,9 +614,36 @@ int sk_chk_filter(struct sock_filter *filter, unsigned int flen)
 			    pc + ftest->jf + 1 >= flen)
 				return -EINVAL;
 			break;
+#define MAYBE_USE_LOAD_FN(CODE) \
+			if (flags & BPF_CHK_FLAGS_NO_SKB) { \
+				code = BPF_S_ANC_##CODE; \
+				break; \
+			}
+		case BPF_S_LD_W_LEN:
+			MAYBE_USE_LOAD_FN(LD_W_LEN);
+			break;
+		case BPF_S_LDX_W_LEN:
+			MAYBE_USE_LOAD_FN(LDX_W_LEN);
+			break;
+		case BPF_S_LD_W_IND:
+			MAYBE_USE_LOAD_FN(LD_W_IND);
+			break;
+		case BPF_S_LD_H_IND:
+			MAYBE_USE_LOAD_FN(LD_H_IND);
+			break;
+		case BPF_S_LD_B_IND:
+			MAYBE_USE_LOAD_FN(LD_B_IND);
+			break;
+		case BPF_S_LDX_B_MSH:
+			MAYBE_USE_LOAD_FN(LDX_B_MSH);
+			break;
 		case BPF_S_LD_W_ABS:
+			MAYBE_USE_LOAD_FN(LD_W_ABS);
+			/* Falls through to BPF_S_LD_B_ABS. */
 		case BPF_S_LD_H_ABS:
+			MAYBE_USE_LOAD_FN(LD_H_ABS);
 		case BPF_S_LD_B_ABS:
+			MAYBE_USE_LOAD_FN(LD_B_ABS);
 #define ANCILLARY(CODE) case SKF_AD_OFF + SKF_AD_##CODE:	\
 				code = BPF_S_ANC_##CODE;	\
 				break
@@ -571,6 +670,12 @@ int sk_chk_filter(struct sock_filter *filter, unsigned int flen)
 		return check_load_and_stores(filter, flen);
 	}
 	return -EINVAL;
+}
+EXPORT_SYMBOL(bpf_chk_filter);
+
+int sk_chk_filter(struct sock_filter *filter, unsigned int flen)
+{
+	return bpf_chk_filter(filter, flen, 0);
 }
 EXPORT_SYMBOL(sk_chk_filter);
 
