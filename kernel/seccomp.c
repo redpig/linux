@@ -17,13 +17,13 @@
 #include <linux/audit.h>
 #include <linux/compat.h>
 #include <linux/filter.h>
+#include <linux/ptrace.h>
 #include <linux/sched.h>
 #include <linux/seccomp.h>
 #include <linux/security.h>
 #include <linux/slab.h>
 #include <linux/uaccess.h>
 
-#include <linux/tracehook.h>
 #include <asm/syscall.h>
 
 /* #define SECCOMP_DEBUG 1 */
@@ -389,14 +389,24 @@ int __secure_computing_int(int this_syscall)
 						 -(action & SECCOMP_RET_DATA),
 						 0);
 			return -1;
-		case SECCOMP_RET_TRAP: {
-			int reason_code = action & SECCOMP_RET_DATA;
+		case SECCOMP_RET_TRAP:
 			/* Show the handler the original registers. */
 			syscall_rollback(current, task_pt_regs(current));
 			/* Let the filter pass back 16 bits of data. */
-			seccomp_send_sigsys(this_syscall, reason_code);
+			seccomp_send_sigsys(this_syscall,
+					    action & SECCOMP_RET_DATA);
 			return -1;
-		}
+		case SECCOMP_RET_TRACE:
+			/* Skip these calls if there is no tracer. */
+			if (!(current->ptrace & PT_TRACE_SECCOMP))
+				return -1;
+			/* Allow the BPF to provide the event message */
+			ptrace_event(PT_TRACE_SECCOMP,
+				     PTRACE_EVENT_SECCOMP,
+				     action & SECCOMP_RET_DATA);
+			if (fatal_signal_pending(current))
+				break;
+			return 0;
 		case SECCOMP_RET_ALLOW:
 			return 0;
 		case SECCOMP_RET_KILL:
