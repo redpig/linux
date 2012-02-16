@@ -181,15 +181,20 @@ static int seccomp_chk_filter(struct sock_filter *filter, unsigned int flen)
 static u32 seccomp_run_filters(int syscall)
 {
 	struct seccomp_filter *f;
-	u32 ret = SECCOMP_RET_KILL;
+	u32 ret = SECCOMP_RET_ALLOW;
+
+	/* Ensure unexpected behavior doesn't result in failing open. */
+	if (WARN_ON(current->seccomp.filter == NULL))
+		return SECCOMP_RET_KILL;
+
 	/*
 	 * All filters are evaluated in order of youngest to oldest. The lowest
-	 * BPF return value always takes priority.
+	 * BPF return value (ignoring the DATA) always takes priority.
 	 */
 	for (f = current->seccomp.filter; f; f = f->prev) {
-		ret = sk_run_filter(NULL, f->insns);
-		if (ret != SECCOMP_RET_ALLOW)
-			break;
+		u32 cur_ret = sk_run_filter(NULL, f->insns);
+		if ((cur_ret & SECCOMP_RET_ACTION) < (ret & SECCOMP_RET_ACTION))
+			ret = cur_ret;
 	}
 	return ret;
 }
@@ -331,6 +336,13 @@ static int mode1_syscalls_32[] = {
 
 void __secure_computing(int this_syscall)
 {
+	/* Filter calls should never use this function. */
+	BUG_ON(current->seccomp.mode == SECCOMP_MODE_FILTER);
+	__secure_computing_int(this_syscall);
+}
+
+int __secure_computing_int(int this_syscall)
+{
 	int mode = current->seccomp.mode;
 	int exit_code = SIGKILL;
 	int *syscall;
@@ -344,16 +356,29 @@ void __secure_computing(int this_syscall)
 #endif
 		do {
 			if (*syscall == this_syscall)
-				return;
+				return 0;
 		} while (*++syscall);
 		break;
 #ifdef CONFIG_SECCOMP_FILTER
-	case SECCOMP_MODE_FILTER:
-		if (seccomp_run_filters(this_syscall) == SECCOMP_RET_ALLOW)
-			return;
+	case SECCOMP_MODE_FILTER: {
+		u32 action = seccomp_run_filters(this_syscall);
+		switch (action & SECCOMP_RET_ACTION) {
+		case SECCOMP_RET_ERRNO:
+			/* Set the low-order 16-bits as a errno. */
+			syscall_set_return_value(current, task_pt_regs(current),
+						 -(action & SECCOMP_RET_DATA),
+						 0);
+			return -1;
+		case SECCOMP_RET_ALLOW:
+			return 0;
+		case SECCOMP_RET_KILL:
+		default:
+			break;
+		}
 		seccomp_filter_log_failure(this_syscall);
 		exit_code = SIGSYS;
 		break;
+	}
 #endif
 	default:
 		BUG();
@@ -364,6 +389,7 @@ void __secure_computing(int this_syscall)
 #endif
 	audit_seccomp(this_syscall);
 	do_exit(exit_code);
+	return -1;	/* never reached */
 }
 
 long prctl_get_seccomp(void)
