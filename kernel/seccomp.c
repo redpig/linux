@@ -60,18 +60,6 @@ struct seccomp_filter {
 /* Limit any path through the tree to 1 megabytes worth of instructions. */
 #define MAX_INSNS_PER_PATH ((1 << 20) / sizeof(struct sock_filter))
 
-static void seccomp_filter_log_failure(int syscall)
-{
-	int compat = 0;
-#ifdef CONFIG_COMPAT
-	compat = is_compat_task();
-#endif
-	pr_info("%s[%d]: %ssystem call %d blocked at 0x%lx\n",
-		current->comm, task_pid_nr(current),
-		(compat ? "compat " : ""),
-		syscall, KSTK_EIP(current));
-}
-
 /**
  * get_u32 - returns a u32 offset into data
  * @data: a unsigned 64 bit value
@@ -413,7 +401,6 @@ int __secure_computing_int(int this_syscall)
 		default:
 			break;
 		}
-		seccomp_filter_log_failure(this_syscall);
 		exit_code = SIGSYS;
 		break;
 	}
@@ -425,7 +412,7 @@ int __secure_computing_int(int this_syscall)
 #ifdef SECCOMP_DEBUG
 	dump_stack();
 #endif
-	audit_seccomp(this_syscall);
+	audit_seccomp(this_syscall, exit_code);
 	do_exit(exit_code);
 	return -1;	/* never reached */
 }
