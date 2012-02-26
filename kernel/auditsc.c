@@ -67,6 +67,7 @@
 #include <linux/syscalls.h>
 #include <linux/capability.h>
 #include <linux/fs_struct.h>
+#include <linux/compat.h>
 
 #include "audit.h"
 
@@ -2539,6 +2540,39 @@ void audit_core_dumps(long signr)
 	audit_log_format(ab, " pid=%d comm=", current->pid);
 	audit_log_untrustedstring(ab, current->comm);
 	audit_log_format(ab, " sig=%ld", signr);
+	audit_log_end(ab);
+}
+
+void __audit_seccomp(unsigned long syscall, long signr, int code)
+{
+	struct audit_buffer *ab;
+
+	ab = audit_log_start(NULL, GFP_KERNEL, AUDIT_ANOM_ABEND);
+	current_uid_gid(&uid, &gid);
+	audit_log_format(ab, "auid=%u uid=%u gid=%u ses=%u",
+			 auid, uid, gid, sessionid);
+	security_task_getsecid(current, &sid);
+	if (sid) {
+		char *ctx = NULL;
+		u32 len;
+
+		if (security_secid_to_secctx(sid, &ctx, &len))
+			audit_log_format(ab, " ssid=%u", sid);
+		else {
+			audit_log_format(ab, " subj=%s", ctx);
+			security_release_secctx(ctx, len);
+		}
+	}
+	audit_log_format(ab, " pid=%d comm=", current->pid);
+	audit_log_untrustedstring(ab, current->comm);
+	audit_log_format(ab, " reason=seccomp");
+	audit_log_format(ab, " sig=%ld", signr);
+	audit_log_format(ab, " syscall=%ld", syscall);
+#ifdef CONFIG_COMPAT
+	audit_log_format(ab, " compat=%d", is_compat_task());
+#endif
+	audit_log_format(ab, " ip=0x%lx", KSTK_EIP(current));
+	audit_log_format(ab, " code=0x%x", code);
 	audit_log_end(ab);
 }
 
