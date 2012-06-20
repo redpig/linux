@@ -118,8 +118,13 @@ export LDS_ELF_FORMAT := $(ELF_FORMAT)
 
 # The wrappers will select whether using "malloc" or the kernel allocator.
 LINK_WRAPS = -Wl,--wrap,malloc -Wl,--wrap,free -Wl,--wrap,calloc
-
 LD_FLAGS_CMDLINE = $(foreach opt,$(LDFLAGS),-Wl,$(opt))
+
+# i386/x86_64 dirs work on Ubuntu. Probably not distro-portable.
+ifeq ($(CONFIG_X11_FB),y)
+#  export LDFLAGS_UM_vmlinux = -L/usr/lib/$(SUBARCH)-linux-gnu/ -lX11 -lXext -lxcb -lXau
+  export LDFLAGS_UM_vmlinux =  /usr/lib/$(SUBARCH)-linux-gnu/libX11.so.6 /usr/lib/$(SUBARCH)-linux-gnu/libXext.so.6
+endif
 
 # Used by link-vmlinux.sh which has special support for um link
 export CFLAGS_vmlinux := $(LINK-y) $(LINK_WRAPS) $(LD_FLAGS_CMDLINE)

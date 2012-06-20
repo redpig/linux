@@ -3,7 +3,7 @@
 #
 
 menu "Graphics support"
-	depends on HAS_IOMEM
+	depends on !S390
 
 config HAVE_FB_ATMEL
 	bool

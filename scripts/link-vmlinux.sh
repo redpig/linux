@@ -62,7 +62,7 @@ vmlinux_link()
 			-Wl,--start-group                                    \
 				 ${KBUILD_VMLINUX_MAIN}                      \
 			-Wl,--end-group                                      \
-			-lutil ${1}
+			${LDFLAGS_UM_vmlinux} -lutil ${1}
 		rm -f linux
 	fi
 }
