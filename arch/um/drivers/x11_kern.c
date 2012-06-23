@@ -25,6 +25,7 @@
 static int x11_enable  = 0;
 static int x11_fps     = 60;
 static int x11_touch   = 0;
+static int x11_mouse_scale = 1;	/* Use xset m 1 for ideal behavior or set scale=2 to leave userland alone */
 static int x11_width;
 static int x11_height;
 
@@ -170,21 +171,11 @@ void x11_mouse_input(struct x11_kerndata *kd, int key, int down,
 		input_sync(kd->mouse);
 		return;
 	}
-	/* Normal mouse. */
-#if 0
-	dx = (((x * kd->var->xres) - kd->mouse_x) / kd->var->xres);
-	dy = (((y * kd->var->yres) - kd->mouse_y) / kd->var->yres);
-	printk(KERN_INFO "rel event @ %d, %d :: %d, %d\n", x, y, dx, dy);
-#endif
-	/* xset m 1/1 to avoid acceleration skew. Or create a virtualized small resolution */
-	input_report_rel(kd->mouse, REL_X, x - kd->mouse_x);
-	input_report_rel(kd->mouse, REL_Y, y - kd->mouse_y);
+	/* Normal mouse scaled by a boot-time configured scalar. */
+	input_report_rel(kd->mouse, REL_X, (x - kd->mouse_x) / x11_mouse_scale);
+	input_report_rel(kd->mouse, REL_Y, (y - kd->mouse_y) / x11_mouse_scale);
 	kd->mouse_x = x;
 	kd->mouse_y = y;
-#if 0
-	kd->mouse_x = dx * kd->var->xres;
-	kd->mouse_y = dy * kd->var->yres;
-#endif
 	if (key != KEY_RESERVED)
 		input_report_key(kd->mouse, key, down);
 	input_sync(kd->mouse);
@@ -455,6 +446,9 @@ static int __init x11_probe(struct device *device)
 	kd->mouse = input_allocate_device();
 	if (NULL == kd->kbd || NULL == kd->mouse)
 		goto fail_free;
+	/* Not used yet, but would provide kd encapsulation. */
+	input_set_drvdata(kd->kbd, kd);
+	input_set_drvdata(kd->mouse, kd);
 
 	kd->win = x11_open(x11_width, x11_height);
 	if (NULL == kd->win) {
@@ -520,21 +514,15 @@ static int __init x11_probe(struct device *device)
 		set_bit(BTN_RIGHT,  kd->mouse->keybit);
 		set_bit(REL_X,      kd->mouse->relbit);
 		set_bit(REL_Y,      kd->mouse->relbit);
-#if 0
-		input_abs_set_min(kd->mouse, ABS_X, 0);
-		input_abs_set_max(kd->mouse, ABS_X, kd->var->xres);
-		input_abs_set_min(kd->mouse, ABS_Y, 0);
-		input_abs_set_max(kd->mouse, ABS_Y, kd->var->yres);
-#endif
 	} else {
 		set_bit(EV_ABS,     kd->mouse->evbit);
 		set_bit(ABS_X,      kd->mouse->absbit);
 		set_bit(ABS_Y,      kd->mouse->absbit);
-		set_bit(ABS_MT_TOUCH_MAJOR,      kd->mouse->absbit);
-		set_bit(ABS_MT_POSITION_X,      kd->mouse->absbit);
-		set_bit(ABS_MT_POSITION_Y,      kd->mouse->absbit);
-		set_bit(ABS_PRESSURE,      kd->mouse->absbit);
-		set_bit(BTN_TOUCH,  kd->mouse->keybit);
+		set_bit(ABS_MT_TOUCH_MAJOR, kd->mouse->absbit);
+		set_bit(ABS_MT_POSITION_X, kd->mouse->absbit);
+		set_bit(ABS_MT_POSITION_Y, kd->mouse->absbit);
+		set_bit(ABS_PRESSURE, kd->mouse->absbit);
+		set_bit(BTN_TOUCH, kd->mouse->keybit);
 		input_set_abs_params(kd->mouse, ABS_MT_TOUCH_MAJOR, 0, 255, 0, 0);
 		input_set_abs_params(kd->mouse, ABS_MT_POSITION_X, 0, kd->var->xres, 0, 0);
 		input_set_abs_params(kd->mouse, ABS_MT_POSITION_Y, 0, kd->var->yres, 0, 0);
@@ -548,7 +536,7 @@ static int __init x11_probe(struct device *device)
 	if (err)
 		goto fail_vfree;
 
-	kd->refresh_wq = alloc_workqueue("kx11d", WQ_CPU_INTENSIVE | WQ_MEM_RECLAIM | WQ_UNBOUND, num_online_cpus());
+	kd->refresh_wq = alloc_workqueue("kx11d", WQ_CPU_INTENSIVE | WQ_MEM_RECLAIM | WQ_UNBOUND, 1);
 	if (!kd->refresh_wq) {
 		err = -ENOMEM;
 		goto fail_vfree; /* not quite right. */
@@ -642,10 +630,18 @@ __setup("x11=", x11_setup);
 static int x11_input(char *str)
 {
 	printk("%s: x11_input=%s\n",__FUNCTION__,str);
+	char *match;
 	if (strstr(str, "touch:1")) {
 		x11_touch = 1;
 		printk(KERN_INFO "uml-x11-fb: simulating touch events\n");
 	}
+	match = strstr(str, "scale:");
+	if (match) {
+		if (1 != sscanf(match, "scale:%d", &x11_mouse_scale) || x11_mouse_scale == 0)
+			x11_mouse_scale = 1;
+		printk(KERN_INFO "uml-x11-fb: mouse scale = %d\n", x11_mouse_scale);
+	}
+
 	return 0;
 }
 __setup("x11_input=", x11_input);
