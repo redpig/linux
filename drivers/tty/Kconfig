@@ -1,6 +1,6 @@
 config VT
 	bool "Virtual terminal" if EXPERT
-	depends on !S390 && !UML
+	depends on !S390
 	select INPUT
 	default y
 	---help---
@@ -66,12 +66,12 @@ config VT_CONSOLE_SLEEP
 
 config HW_CONSOLE
 	bool
-	depends on VT && !UML
+	depends on VT
 	default y
 
 config VT_HW_CONSOLE_BINDING
        bool "Support for binding and unbinding console drivers"
-       depends on HW_CONSOLE
+       depends on HW_CONSOLE && !UML
        default n
        ---help---
          The virtual terminal is the device that interacts with the physical

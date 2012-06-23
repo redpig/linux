@@ -361,8 +361,8 @@ have_ximage:
 	win->var.xres           = width;
 	win->var.xres_virtual   = width;
 	win->var.yres           = height;
+	/* win->var.yres_virtual   = height * 2;  for android page flipping */
 	win->var.yres_virtual   = height;
-	// win->var.yres_virtual   = height * 2;
 	win->var.bits_per_pixel = bytes_pp * 8;
 	win->var.pixclock       = 10000000 / win->var.xres * 1000 / win->var.yres;
 	win->var.left_margin    = (win->var.xres / 8) & 0xf8;

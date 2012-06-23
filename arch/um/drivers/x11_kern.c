@@ -18,28 +18,36 @@
 #include "x11_user.h"
 
 #define DRIVER_NAME "uml-x11-fb"
+/* #define X11_UM_DEBUG 1 */
 
 /* ------------------------------------------------------------------ */
 
 static int x11_enable  = 0;
-static int x11_fps     = 5;
+static int x11_fps     = 60;
+static int x11_touch   = 0;
 static int x11_width;
 static int x11_height;
 
 struct x11_mapping {
-	struct list_head	  next;
+	struct list_head	  entry;
 	struct vm_area_struct     *vma;
 	atomic_t                  map_refs;
 	int                       faults;
 	struct x11_kerndata       *kd;
 };
 
+struct x11_kerndata;
+struct x11_work {
+	struct work_struct work; /* Only one work struct is ever needed right now */
+	struct x11_kerndata *kd;
+};
+
 struct x11_kerndata {
 	/* common stuff */
 	struct x11_window         *win;
-	struct task_struct        *kthread;
-	wait_queue_head_t         wq;
+	struct workqueue_struct   *refresh_wq;
 	int                       has_data;
+	struct x11_work		  work;
 
 	/* framebuffer driver */
 	unsigned char             *fb;
@@ -58,6 +66,9 @@ struct x11_kerndata {
 	/* input drivers */
 	struct input_dev          *kbd;
 	struct input_dev          *mouse;
+	int 			  mouse_x;
+	int 			  mouse_y;
+	int			  depressed;
 };
 
 void x11_update_screen(struct x11_kerndata *kd)
@@ -72,7 +83,7 @@ void x11_update_screen(struct x11_kerndata *kd)
 	kd->dirty = kd->y1 = kd->y2 = 0;
 	down(&kd->mm_lock);
 	list_for_each(item, &kd->mappings) {
-		map = list_entry(item, struct x11_mapping, next);
+		map = list_entry(item, struct x11_mapping, entry);
 		if (!map->faults)
 			continue;
 		zap_page_range(map->vma, map->vma->vm_start,
@@ -85,31 +96,27 @@ void x11_update_screen(struct x11_kerndata *kd)
 	length = (y2 - y1) * kd->fix->line_length;
 	src = kd->fb + offset;
 	dst = x11_get_fbmem(kd->win) + offset;
-	memcpy(dst,src,length);
+	memcpy(dst, src, length);
 	x11_blit_fb(kd->win, y1, y2);
 }
 
-static int x11_thread(void *data)
+static void x11_thread(struct work_struct *wrk)
 {
-	struct x11_kerndata *kd = data;
-	DECLARE_WAITQUEUE(wait,current);
+	struct x11_work *w = container_of(wrk, struct x11_work, work);
+	struct x11_kerndata *kd = w->kd;
 
-	add_wait_queue(&kd->wq, &wait);
-	for (;;) {
-		if (kthread_should_stop())
-			break;
-		if (kd->dirty)
-			x11_update_screen(kd);
-		if (kd->has_data) {
-			kd->has_data = 0;
-			x11_has_data(kd->win,kd);
-			reactivate_fd(x11_get_fd(kd->win), X11_IRQ);
-		}
-		set_current_state(TASK_INTERRUPTIBLE);
-		schedule();
+	/* This can be MUCH more efficient. Just trying to get it cleaned up. */
+	if (!kd->dirty && !kd->has_data) {
+		printk("x11_thread: not dirty. Bailing\n");
+		return;
 	}
-	remove_wait_queue(&kd->wq, &wait);
-	return 0;
+	if (kd->dirty)
+		x11_update_screen(kd);
+	if (kd->has_data) {
+		kd->has_data = 0;
+		x11_has_data(kd->win,kd);
+		reactivate_fd(x11_get_fd(kd->win), X11_IRQ);
+	}
 }
 
 /* ------------------------------------------------------------------ */
@@ -130,10 +137,56 @@ void x11_kbd_input(struct x11_kerndata *kd, int key, int down)
 void x11_mouse_input(struct x11_kerndata *kd, int key, int down,
 		     int x, int y)
 {
+	int dx, dy;
+#ifdef X11_UM_DEBUG
+	printk("mouse_input: key:%d down:%d x:%d y:%d\n", key, down, x, y);
+#endif
+	if (x11_touch) {
+		if (key != KEY_RESERVED) {
+			if (down) {
+				input_report_abs(kd->mouse, ABS_MT_TOUCH_MAJOR, 255);
+				input_report_abs(kd->mouse, ABS_MT_POSITION_X, x);
+				input_report_abs(kd->mouse, ABS_MT_POSITION_Y, y);
+				input_report_abs(kd->mouse, ABS_PRESSURE, 255);
+				/* Map all buttons to touch right now */
+				input_report_key(kd->mouse, BTN_TOUCH, 1);
+				printk(KERN_INFO "touch @ %d, %d\n", x, y);
+				kd->depressed = 1;
+			} else {
+				input_report_abs(kd->mouse, ABS_MT_TOUCH_MAJOR, 0);
+				input_report_abs(kd->mouse, ABS_PRESSURE, 0);
+				input_report_key(kd->mouse, BTN_TOUCH, 0);
+				printk(KERN_INFO "touch released @ %d, %d\n", x, y);
+				kd->depressed = 0;
+			}
+		} else {
+			if (kd->depressed) {
+				input_report_abs(kd->mouse, ABS_MT_POSITION_X, x);
+				input_report_abs(kd->mouse, ABS_MT_POSITION_Y, y);
+				printk(KERN_INFO "touch dragged @ %d, %d\n", x, y);
+			}
+		}
+		input_mt_sync(kd->mouse);
+		input_sync(kd->mouse);
+		return;
+	}
+	/* Normal mouse. */
+#if 0
+	dx = (((x * kd->var->xres) - kd->mouse_x) / kd->var->xres);
+	dy = (((y * kd->var->yres) - kd->mouse_y) / kd->var->yres);
+	printk(KERN_INFO "rel event @ %d, %d :: %d, %d\n", x, y, dx, dy);
+#endif
+	/* xset m 1/1 to avoid acceleration skew. Or create a virtualized small resolution */
+	input_report_rel(kd->mouse, REL_X, x - kd->mouse_x);
+	input_report_rel(kd->mouse, REL_Y, y - kd->mouse_y);
+	kd->mouse_x = x;
+	kd->mouse_y = y;
+#if 0
+	kd->mouse_x = dx * kd->var->xres;
+	kd->mouse_y = dy * kd->var->yres;
+#endif
 	if (key != KEY_RESERVED)
 		input_report_key(kd->mouse, key, down);
-	input_report_abs(kd->mouse, ABS_X, x);
-	input_report_abs(kd->mouse, ABS_Y, y);
 	input_sync(kd->mouse);
 }
 
@@ -149,7 +202,6 @@ static int x11_setcolreg(unsigned regno, unsigned red, unsigned green,
 			 unsigned blue, unsigned transp,
 			 struct fb_info *info)
 {
-	printk("%s\n",__FUNCTION__);
 	if (regno >= info->cmap.len)
 		return 1;
 
@@ -195,14 +247,14 @@ static void x11_fb_timer(unsigned long data)
 {
 	struct x11_kerndata *kd = (struct x11_kerndata*)data;
 	kd->dirty++;
-	wake_up(&kd->wq);
+	/* XXX: reuses work. COuld be sad if it overlaps. */
+	queue_work(kd->refresh_wq, &kd->work.work);
 }
 
 static void x11_fb_refresh(struct x11_kerndata *kd, int y1, int h)
 {
 	int y2;
 
-	printk("%s\n",__FUNCTION__);
 	y2 = y1 + h;
 	if (0 == kd->y2) {
 		kd->y1 = y1;
@@ -213,6 +265,7 @@ static void x11_fb_refresh(struct x11_kerndata *kd, int y1, int h)
 	if (kd->y2 < y2)
 		kd->y2 = y2;
 
+	/* XXX: this needed */
 	if (timer_pending(&kd->refresh))
 		return;
 	mod_timer(&kd->refresh, jiffies + HZ/x11_fps);
@@ -222,25 +275,26 @@ void x11_fillrect(struct fb_info *p, const struct fb_fillrect *rect)
 {
 	struct x11_kerndata *kd = p->par;
 
-	printk("%s\n",__FUNCTION__);
 	cfb_fillrect(p, rect);
+	down(&kd->mm_lock);
 	x11_fb_refresh(kd, rect->dy, rect->height);
+	up(&kd->mm_lock);
 }
 
 void x11_imageblit(struct fb_info *p, const struct fb_image *image)
 {
 	struct x11_kerndata *kd = p->par;
 
-	printk("%s\n",__FUNCTION__);
 	cfb_imageblit(p, image);
+	down(&kd->mm_lock);
 	x11_fb_refresh(kd, image->dy, image->height);
+	up(&kd->mm_lock);
 }
 
 void x11_copyarea(struct fb_info *p, const struct fb_copyarea *area)
 {
 	struct x11_kerndata *kd = p->par;
 
-	printk("%s\n",__FUNCTION__);
 	cfb_copyarea(p, area);
 	x11_fb_refresh(kd, area->dy, area->height);
 }
@@ -252,7 +306,6 @@ x11_fb_vm_open(struct vm_area_struct *vma)
 {
 	struct x11_mapping *map = vma->vm_private_data;
 
-	printk("%s\n",__FUNCTION__);
 	atomic_inc(&map->map_refs);
 }
 
@@ -262,10 +315,9 @@ x11_fb_vm_close(struct vm_area_struct *vma)
 	struct x11_mapping *map = vma->vm_private_data;
 	struct x11_kerndata *kd = map->kd;
 
-	printk("%s\n",__FUNCTION__);
 	down(&kd->mm_lock);
 	if (atomic_dec_and_test(&map->map_refs)) {
-		list_del(&map->next);
+		list_del(&map->entry);
 		kfree(map);
 	}
 	up(&kd->mm_lock);
@@ -281,10 +333,7 @@ x11_fb_vm_nopage(struct vm_area_struct *vma, struct vm_fault *vmf)
 	struct page *page;
 	int y1,y2;
 
-	printk("%s\n",__FUNCTION__);
-        if (pgnr >= kd->nr_pages) {
-		printk("offset: %lu (%lu - %lu)\n", (vmf->pgoff - vma->vm_start), vmf->pgoff, vma->vm_start);
-		printk("%lu >= %lu\n", pgnr, kd->nr_pages);
+	if (pgnr >= kd->nr_pages) {
 		return VM_FAULT_SIGBUS;
 	}
 
@@ -293,8 +342,8 @@ x11_fb_vm_nopage(struct vm_area_struct *vma, struct vm_fault *vmf)
 	get_page(page);
 	map->faults++;
 
-	y1 = pgnr * PAGE_SIZE / kd->fix->line_length;
-	y2 = (pgnr * PAGE_SIZE + PAGE_SIZE-1) / kd->fix->line_length;
+	y1 = (pgnr << PAGE_SHIFT) / kd->fix->line_length;
+	y2 = ((pgnr << PAGE_SHIFT) + PAGE_SIZE-1) / kd->fix->line_length;
 	if (y2 > kd->var->yres)
 		y2 = kd->var->yres;
 	x11_fb_refresh(kd, y1, y2 - y1);
@@ -353,11 +402,12 @@ int x11_mmap(struct fb_info *p,  struct vm_area_struct * vma)
 	map->faults = 0;
 	map->kd = kd;
 	atomic_set(&map->map_refs,1);
-	list_add(&map->next,&kd->mappings);
+	list_add_tail(&map->entry, &kd->mappings);
 	vma->vm_ops   = &x11_fb_vm_ops;
 	vma->vm_flags |= VM_DONTEXPAND | VM_RESERVED;
 	vma->vm_private_data = map;
 	retval = 0;
+	map = NULL; /* Streamline out flow */
 
 out:
 	if (map)
@@ -382,10 +432,12 @@ static struct fb_ops x11_fb_ops = {
 static irqreturn_t x11_irq(int irq, void *data)
 {
 	struct x11_kerndata *kd = data;
-
-	printk("%s\n",__FUNCTION__);
+#ifdef X11_UM_DEBUG
+	printk("x11_irq fired!\n");
+#endif
 	kd->has_data++;
-	wake_up(&kd->wq);
+	queue_work(kd->refresh_wq, &kd->work.work);
+
 	return IRQ_HANDLED;
 }
 
@@ -395,7 +447,6 @@ static int __init x11_probe(struct device *device)
 	int i;
 	int err;
 
-	printk("%s\n",__FUNCTION__);
 	kd = kzalloc(sizeof(*kd),GFP_KERNEL);
 	if (NULL == kd)
 		return -ENOMEM;
@@ -452,7 +503,7 @@ static int __init x11_probe(struct device *device)
 	for (i = 0; i < KEY_MAX; i++)
 		set_bit(i, kd->kbd->keybit);
 	kd->kbd->id.bustype = BUS_HOST;
-	kd->kbd->name = DRIVER_NAME " virtual keyboard";
+	kd->kbd->name = DRIVER_NAME "-keyboard";
 	kd->kbd->phys = DRIVER_NAME "/input0";
 	//kd->kbd->dev = device;
 	err = input_register_device(kd->kbd);
@@ -460,40 +511,66 @@ static int __init x11_probe(struct device *device)
 		goto fail_vfree;
 
 	/* mouse setup */
-        kd->mouse = input_allocate_device();
-	set_bit(EV_ABS,     kd->mouse->evbit);
 	set_bit(EV_KEY,     kd->mouse->evbit);
-	set_bit(BTN_TOUCH,  kd->mouse->keybit);
-	set_bit(BTN_LEFT,   kd->mouse->keybit);
-	set_bit(BTN_MIDDLE, kd->mouse->keybit);
-	set_bit(BTN_RIGHT,  kd->mouse->keybit);
-	set_bit(ABS_X,      kd->mouse->absbit);
-	set_bit(ABS_Y,      kd->mouse->absbit);
-	input_abs_set_min(kd->mouse, ABS_X, 0);
-	input_abs_set_max(kd->mouse, ABS_X, kd->var->xres);
-	input_abs_set_min(kd->mouse, ABS_Y, 0);
-	input_abs_set_max(kd->mouse, ABS_Y, kd->var->yres);
+	set_bit(EV_SYN,     kd->mouse->evbit);
+	if (!x11_touch) {
+		set_bit(EV_REL,     kd->mouse->evbit);
+		set_bit(BTN_LEFT,   kd->mouse->keybit);
+		set_bit(BTN_MIDDLE, kd->mouse->keybit);
+		set_bit(BTN_RIGHT,  kd->mouse->keybit);
+		set_bit(REL_X,      kd->mouse->relbit);
+		set_bit(REL_Y,      kd->mouse->relbit);
+#if 0
+		input_abs_set_min(kd->mouse, ABS_X, 0);
+		input_abs_set_max(kd->mouse, ABS_X, kd->var->xres);
+		input_abs_set_min(kd->mouse, ABS_Y, 0);
+		input_abs_set_max(kd->mouse, ABS_Y, kd->var->yres);
+#endif
+	} else {
+		set_bit(EV_ABS,     kd->mouse->evbit);
+		set_bit(ABS_X,      kd->mouse->absbit);
+		set_bit(ABS_Y,      kd->mouse->absbit);
+		set_bit(ABS_MT_TOUCH_MAJOR,      kd->mouse->absbit);
+		set_bit(ABS_MT_POSITION_X,      kd->mouse->absbit);
+		set_bit(ABS_MT_POSITION_Y,      kd->mouse->absbit);
+		set_bit(ABS_PRESSURE,      kd->mouse->absbit);
+		set_bit(BTN_TOUCH,  kd->mouse->keybit);
+		input_set_abs_params(kd->mouse, ABS_MT_TOUCH_MAJOR, 0, 255, 0, 0);
+		input_set_abs_params(kd->mouse, ABS_MT_POSITION_X, 0, kd->var->xres, 0, 0);
+		input_set_abs_params(kd->mouse, ABS_MT_POSITION_Y, 0, kd->var->yres, 0, 0);
+		input_set_abs_params(kd->mouse, ABS_PRESSURE, 0, 255, 0, 0);
+	}
 	kd->mouse->id.bustype = BUS_HOST;
-	kd->mouse->name = DRIVER_NAME " virtual mouse";
+	kd->mouse->name = DRIVER_NAME "-mouse";
 	kd->mouse->phys = DRIVER_NAME "/input1";
 	//kd->mouse->dev = device;
 	err = input_register_device(kd->mouse);
 	if (err)
 		goto fail_vfree;
 
+	kd->refresh_wq = alloc_workqueue("kx11d", WQ_CPU_INTENSIVE | WQ_MEM_RECLAIM | WQ_UNBOUND, num_online_cpus());
+	if (!kd->refresh_wq) {
+		err = -ENOMEM;
+		goto fail_vfree; /* not quite right. */
+	}
+	kd->work.kd = kd;
+	INIT_WORK(&kd->work.work, x11_thread);
+
 	/* misc common kernel stuff */
 	sema_init(&kd->mm_lock, 1);
-	init_waitqueue_head(&kd->wq);
 	init_timer(&kd->refresh);
 	kd->refresh.function = x11_fb_timer;
 	kd->refresh.data     = (unsigned long)kd;
 
-	kd->kthread = kthread_run(x11_thread, kd,
-				  DRIVER_NAME " thread");
-	um_request_irq(X11_IRQ, x11_get_fd(kd->win), IRQ_READ, x11_irq,
-		       IRQF_SHARED | IRQF_DISABLED, DRIVER_NAME, kd);
+#ifdef X11_UM_DEBUG
+	printk(KERN_INFO "x11 fd: %d\n", x11_get_fd(kd->win));
+#endif
+	err = um_request_irq(X11_IRQ, x11_get_fd(kd->win), IRQ_READ, x11_irq,
+		       IRQF_SHARED, DRIVER_NAME, kd);
+	if (err)
+		printk(KERN_ERR "x11fb failed to get input IRQ\n");
 
-	return 0;
+	return err;
 
 fail_vfree:
 	vfree(kd->fb);
@@ -519,8 +596,8 @@ static struct platform_device x11_device = {
 
 static int __init x11_init(void)
 {
-	printk("%s\n",__FUNCTION__);
 	int ret;
+	printk("%s\n",__FUNCTION__);
 
 	ret = driver_register(&x11_driver);
 	printk("%s driver_register=%d\n",__FUNCTION__,ret);
@@ -551,18 +628,27 @@ static int x11_setup(char *str)
 	printk("%s: x11=%s\n",__FUNCTION__,str);
 	if (3 == sscanf(str,"%dx%d@%d",&x11_width,&x11_height,&x11_fps) ||
 	    2 == sscanf(str,"%dx%d",&x11_width,&x11_height)) {
-//#if defined(CONFIG_DUMMY_CONSOLE)
 		//printk("%s: enable linux vt subsystem\n",__FUNCTION__);
 		x11_enable = 1;
-		//console_use_vt = 1;
-		//conswitchp = &dummy_con;
-//#endif
+#if defined(CONFIG_DUMMY_CONSOLE)
+		conswitchp = &dummy_con;
+#endif
 		return 0;
 	}
 	return -1;
 }
 __setup("x11=", x11_setup);
 
+static int x11_input(char *str)
+{
+	printk("%s: x11_input=%s\n",__FUNCTION__,str);
+	if (strstr(str, "touch:1")) {
+		x11_touch = 1;
+		printk(KERN_INFO "uml-x11-fb: simulating touch events\n");
+	}
+	return 0;
+}
+__setup("x11_input=", x11_input);
 /*
  * Local variables:
  * c-basic-offset: 8
